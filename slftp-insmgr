@@ -1,0 +1,534 @@
+#!/bin/bash
+version="0.0.1"
+header="\
+#------------------------------------------------------------------------------
+#                                                   SLFTP - Instance Manager
+#                                 By ZarTeK - https://github.com/ZarTek-Creole
+#           Project - https://github.com/ZarTek-Creole/SLFTP-Instance-Manager
+#           Donate - https://github.com/ZarTek-Creole/DONATE
+#        This script allows you to conveniently manage the SLFTP service.
+#   For inquiries or support, feel free to contact us through the project page.
+#------------------------------------------------------------------------------"
+
+verifyCommands() {
+    local -r requiredCommands=("systemctl" "screen" "jq" "tar")
+
+    for cmd in "${requiredCommands[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 || {
+            echo "$cmd is required but it's not installed. Install it and try again."
+            exit 1
+        }
+    done
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        echo "Big error : curl or wget is required but it's not installed. Install it and try again."
+        exit 1
+    fi
+}
+
+fetchContent() {
+    local -r url=$1
+
+    [[ $(command -v curl) ]] && curl -fsSL "$url" || wget -qO- "$url"
+}
+
+downloadUrl() {
+    local -r url=$1
+    local -r outputFile=$2
+
+    [[ $(command -v curl) ]] && curl -fsSL -o "$outputFile" "$url" || wget -qO "$outputFile" "$url"
+}
+checkRoot() {
+    if [ "$EUID" -ne 0 ]; then
+        echo "Please run as root or use sudo"
+        exit 1
+    fi
+}
+
+checkBinary() {
+    local -r slftpPath=$1
+
+    if [ ! -x "$slftpPath" ]; then
+        echo "File '$slftpPath' is not an executable binary or doesn't exist. Check the path and try again."
+        exit 1
+    fi
+}
+
+fileData() {
+    local -r slftpPath=$1
+
+    workingDir=$(dirname "$slftpPath")
+    targetUser=$(stat -c '%U' "$slftpPath")
+    targetGroup=$(stat -c '%G' "$slftpPath")
+}
+
+serviceName() {
+    local -r slftpName=$1
+
+    if [ -z "$slftpName" ] || [ "$slftpName" = "slftp" ]; then
+        serviceName="slftp_$targetUser"
+        startFileName="slftp_start_$targetUser.sh"
+    else
+        serviceName="slftp_$slftpName"
+        startFileName="slftp_start_$slftpName.sh"
+    fi
+}
+
+serviceExists() {
+    systemctl --all --type=service --full --no-pager | grep -Fq "$serviceName.service" && {
+        echo "Service '$serviceName' already exists. Please uninstall before proceeding."
+        exit 1
+    }
+}
+
+createServiceFile() {
+    cat >"/etc/systemd/system/$serviceName.service" <<EOF
+# $header
+[Unit]
+Description=SLFTP Service ($serviceName)
+After=network.target
+
+[Service]
+Type=forking
+WorkingDirectory=$workingDir
+ExecStart=/usr/bin/screen -dmS $serviceName $workingDir/$startFileName
+ExecStop=/usr/bin/screen -S $serviceName -X quit
+User=$targetUser
+Group=$targetGroup
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+createStartFile() {
+    cat >"$workingDir/$startFileName" <<EOF
+# $header
+cd $workingDir || exit
+./slftp
+EOF
+    # Mettre les bonnes permissions sur le fichier 'start.sh'
+    chown "$targetUser":"$targetGroup" "$workingDir/$startFileName"
+    chmod +x "$workingDir/$startFileName"
+
+    # Créer le script '/usr/local/bin/slftp'
+    cat >"/usr/local/bin/$serviceName" <<EOF
+# $header
+#!/bin/bash
+
+# Récupérer le nom de l'utilisateur actuel
+currentUser=\$(whoami)
+
+# Vérifier que le script est exécuté en tant que root
+if [ "\$currentUser" != "root" ]; then
+    echo "Ce script doit être exécuté en tant que root ou avec sudo."
+    exit 1
+fi
+
+# Intercepter les arguments et appeler les commandes appropriées
+case \$1 in
+    start)
+        systemctl start $serviceName
+        ;;
+    stop)
+        systemctl stop $serviceName
+        ;;
+    restart)
+        systemctl restart $serviceName
+        ;;
+    status)
+        systemctl status $serviceName
+        ;;
+    join)
+        su $targetUser -- -c "screen -r $serviceName"
+        ;;
+    *)
+        echo "Console $serviceName - Par ZarTeK - https://github.com/ZarTek-Creole"
+        echo "Commande inconnue : \$1"
+        echo "Usage : $serviceName [start|stop|restart|status|join]"
+        exit 1
+        ;;
+esac
+
+exit 0
+EOF
+
+    # Mettre les bonnes permissions sur le script '/usr/local/bin/slftp'
+    chmod +x "/usr/local/bin/$serviceName"
+
+    # Recharger le daemon systemd pour qu'il prenne en compte le nouveau service
+    systemctl daemon-reload
+
+    echo "Installation terminée. Vous pouvez maintenant gérer le service $serviceName avec la commande '$serviceName' et l'un des arguments suivants : start, stop, restart, status, join."
+
+}
+print_helpMain() {
+    echo "Usage: $0 {self|slftp|instance}"
+    echo ""
+    echo "Commands:"
+    echo "  self     Commandes pour la gestion du SLFTP instance Manager (ce script)"
+    echo "           Options: {install|uninstall|update|version}"
+    echo ""
+    echo "  slftp    Commandes pour la gestion de SLFTP"
+    echo "           Options: {install|update}"
+    echo ""
+    echo "  instance Commandes pour la gestion des instances de SLFTP"
+    echo "           Options: {create|join|start|restart|stop|remove|version|read-log|delete-log|backup}"
+    echo ""
+    echo "Example:"
+    echo "  $0 self install     Installer ce script"
+    echo "  $0 slftp install    Installer SLFTP"
+    echo "  $0 instance start   Démarrer une instance de SLFTP"
+}
+print_helpSelf() {
+    echo "Usage: $0 self {install|uninstall|update|version}"
+    echo ""
+    echo "Sub-commands:"
+    echo "  install    Installe 'SLFTP - Instance Manager' (ce script) de manière permanente"
+    echo "  uninstall  Désinstalle 'SLFTP - Instance Manager' (ce script)"
+    echo "  update     Met à jour 'SLFTP - Instance Manager' (ce script) depuis le dépôt GitHub"
+    echo "  version    Affiche la version actuelle de 'SLFTP - Instance Manager'"
+    echo ""
+    echo "Example:"
+    echo "  $0 self install   Installer ce script"
+}
+
+print_helpSLFTP() {
+    echo "
+SLFTP Options:
+
+    install     Install a specific version of SLFTP, or the latest stable or development version. Usage: slftp install {stable|devel|<specific-version>}
+    list        List all installed versions of SLFTP. Usage: slftp list
+    uninstall   Uninstall a specific version of SLFTP. Usage: slftp uninstall <version>
+    update      Update a specific version of SLFTP. Usage: slftp update <version>
+    use         Set a specific version of SLFTP as the default version. Usage: slftp use <version>
+    "
+}
+
+print_helpInstance() {
+    echo "Usage: $0 instance {create|join|start|restart|stop|remove|version|read-log|delete-log|backup}"
+    echo ""
+    echo "Sub-commands:"
+    echo "  create     Crée une nouvelle instance de SLFTP"
+    echo "  join       Rejoint une instance de SLFTP existante"
+    echo "  start      Démarre une instance de SLFTP"
+    echo "  restart    Redémarre une instance de SLFTP"
+    echo "  stop       Arrête une instance de SLFTP"
+    echo "  remove     Supprime une instance de SLFTP"
+    echo "  version    Affiche la version de l'instance de SLFTP"
+    echo "  read-log   Lit le fichier journal de l'instance de SLFTP"
+    echo "  delete-log Supprime le fichier journal de l'instance de SLFTP"
+    echo "  backup     Crée une sauvegarde de l'instance de SLFTP"
+    echo ""
+    echo "Example:"
+    echo "  $0 instance create  Crée une nouvelle instance de SLFTP"
+}
+
+insmgrInstall() {
+    checkRoot
+    local binaryUrl="https://raw.githubusercontent.com/ZarTek-Creole/SLFTP-Instance-Manager/main/slftp-insmgr"
+    local binaryDestination="/usr/local/bin/slftp-insmgr"
+
+    # Vérifie si le fichier existe déjà
+    if [ -f "$binaryDestination" ]; then
+        echo "SLFTP Instance Manager is already installed."
+        return 0
+    fi
+
+    # Télécharge le script
+    downloadUrl "$binaryUrl" "$binaryDestination"
+
+    # Donne les permissions d'exécution
+    chmod +x "$binaryDestination"
+
+    # Vérifie que le script est bien installé
+    if command -v slftp-insmgr >/dev/null 2>&1; then
+        echo "SLFTP Instance Manager installed successfully."
+    else
+        echo "SLFTP Instance Manager could not be installed."
+        exit 1
+    fi
+}
+insmgrUpdate() {
+    checkRoot
+    local binaryUrl="https://raw.githubusercontent.com/ZarTek-Creole/SLFTP-Instance-Manager/main/slftp-insmgr"
+    local binaryDestination="/usr/local/bin/slftp-insmgr"
+
+    # Télécharge le nouveau script
+    downloadUrl "$binaryUrl" "$binaryDestination"
+
+    # Donne les permissions d'exécution
+    chmod +x "$binaryDestination"
+
+    # Vérifie que le script est bien installé
+    if command -v slftp-insmgr >/dev/null 2>&1; then
+        echo "SLFTP Instance Manager updated successfully."
+    else
+        echo "SLFTP Instance Manager could not be updated."
+        exit 1
+    fi
+}
+insmgrUninstall() {
+    local binaryDestination="/usr/local/bin/slftp-insmgr"
+
+    # Vérifie que le script est bien installé
+    if ! command -v slftp-insmgr >/dev/null 2>&1; then
+        echo "SLFTP Instance Manager is not installed."
+        exit 1
+    fi
+
+    # Supprime le fichier
+    rm "$binaryDestination"
+
+    # Vérifie que le script a été supprimé
+    if command -v slftp-insmgr >/dev/null 2>&1; then
+        echo "SLFTP Instance Manager could not be uninstalled."
+        exit 1
+    else
+        echo "SLFTP Instance Manager uninstalled successfully."
+    fi
+}
+insmgrVersion() {
+    local insmgrUrl="https://raw.githubusercontent.com/ZarTek-Creole/SLFTP-Instance-Manager/main/slftp-insmgr"
+
+    # Obtient le script distant
+    local insmgrContent=$(fetchContent "$insmgrUrl")
+
+    # Obtient la version distante
+    local remoteVersion=$(echo "$insmgrContent" | grep "^version=" | cut -d'"' -f2)
+
+    # Affiche les versions
+    echo "Local version: $version"
+    echo "Remote version: $remoteVersion"
+
+    # Compare les versions
+    if [ "$version" = "$remoteVersion" ]; then
+        echo "You are using the latest version of SLFTP Instance Manager."
+    else
+        echo "There is a newer version of SLFTP Instance Manager available."
+    fi
+}
+removeExtraTextFromVersion() {
+    local version=$1
+    version=${version// " (Devel version)"/}
+    version=${version// " (Stable version)"/}
+    echo "$version"
+}
+
+getAvailableVersions() {
+    local versions=("Current (Devel version)")
+    local versionArray
+    readarray -t versionArray <<<"$(fetchContent "https://gitlab.com/api/v4/projects/slftp%2Fslftp/releases" | jq -r '.[].tag_name')"
+    versions+=("${versionArray[0]} (Stable version)")
+
+    if [ "${#versionArray[@]}" -gt 1 ]; then
+        versions+=("${versionArray[@]:1}")
+    fi
+    echo "${versions[@]}"
+}
+
+getDownloadLink() {
+    local version=$1
+    local url=""
+    echo "Getting download link for version: $version"
+    if [ "$version" == "Current (Devel version)" ]; then
+        url="https://gitlab.com/slftp/slftp/-/archive/dev/slftp-dev.tar.gz"
+    else
+        version=$(removeExtraTextFromVersion "$version")
+        case $version in
+        stable)
+            version=$(fetchContent "https://gitlab.com/api/v4/projects/slftp%2Fslftp/releases" | jq -r '.[0].tag_name')
+            url="https://gitlab.com/slftp/slftp/-/archive/$version/slftp-$version.tar.gz"
+            ;;
+        *)
+            url="https://gitlab.com/slftp/slftp/-/archive/$version/slftp-$version.tar.gz"
+            ;;
+        esac
+    fi
+    echo "Generated download URL: $url"
+    echo "$url"
+}
+
+
+getInstallDirectory() {
+    local version=$1
+    local installDir="/opt/slftp/$version"
+    if [ "$version" == "Current" ]; then
+        installDir="/opt/slftp/dev"
+    fi
+    echo "$installDir"
+}
+
+selectVersion() {
+    local versions=("Current (Devel version)")
+    local versionArray
+    IFS=$'\n' read -rd '' -a versionArray <<<"$(fetchContent "https://gitlab.com/api/v4/projects/slftp%2Fslftp/releases" | jq -r '.[].tag_name' | conta)"
+    versions+=("${versionArray[0]} (Stable version)")
+    if [ "${#versionArray[@]}" -gt 1 ]; then
+        versions+=("${versionArray[@]:1}")
+    fi
+
+   # echo -e "\n\nAvailable SLFTP versions:"
+   # echo "-----------------------------"
+    PS3="Please select the version you want to install: "
+    
+    local selectedVersion
+    if [ -n "$1" ]; then
+        echo "Attempting to select version with index: $1"
+        selectedVersion=${versions[$1-1]}
+        selectedVersion=$(removeExtraTextFromVersion "$selectedVersion")
+      #  echo "Selected version: $selectedVersion"
+    else
+        select selectedVersion in "${versions[@]}"; do
+            if [[ " ${versions[*]} " == *" ${selectedVersion} "* ]]; then
+                selectedVersion=$(removeExtraTextFromVersion "$selectedVersion")
+                break
+            else
+                echo "Invalid selection, please try again."
+            fi
+        done
+    fi
+
+ #   echo -e "\nYou selected: $selectedVersion\n"
+    echo "$selectedVersion"
+}
+
+slftpInstall() {
+    echo "Attempting to install version with index: $1 ddd"
+    local version=$(selectVersion "$1")
+    echo $version
+    exit 1
+    echo "Selected version: $version"
+    local url=$(getDownloadLink "$version")
+    echo "Download URL: $url"
+    local installDir=$(getInstallDirectory "$version")
+    echo "Installation directory: $installDir"
+
+    if [ -z "$url" ]; then
+        echo "Invalid version specified. Please try again with a valid version."
+        exit 1
+    fi
+
+    if [ -d "$installDir" ]; then
+        echo "Version $version already installed."
+        read -p "Do you want to reinstall it? [y/N] " yn
+        case $yn in
+        [Yy]*)
+            rm -rf "$installDir"
+            ;;
+        *)
+            echo "Installation cancelled."
+            exit 1
+            ;;
+        esac
+    fi
+
+    mkdir -p "$installDir"
+
+    echo "Downloading $version version from $url..."
+    fetchContent "$url" | tar xz -C "$installDir" --strip-components=1
+
+    echo "SLFTP $version version installed successfully."
+}
+
+
+
+main() {
+    echo "$header"
+    verifyCommands
+    case $1 in
+    self)
+        case $2 in
+        install)
+            insmgrInstall
+            ;;
+        uninstall)
+            insmgrUninstall
+            ;;
+        update)
+            insmgrUpdate
+            ;;
+        version)
+            insmgrVersion
+            ;;
+        *)
+            echo "Commande non reconnue: $2"
+            print_helpSelf
+            exit 1
+            ;;
+        esac
+        ;;
+    slftp)
+        case $2 in
+        install)
+            slftpInstall "${@:3}"
+            ;;
+        list)
+            slftpList
+            ;;
+        uninstall)
+            slftpUninstall "${@:3}"
+            ;;
+        update)
+            slftpUpdate "${@:3}"
+            ;;
+        use)
+            slftpUse "${@:3}"
+            ;;
+        *)
+            echo "Commande non reconnue: $2"
+            print_helpSLFTP
+            exit 1
+            ;;
+        esac
+        ;;
+
+    instance)
+        case $2 in
+        create)
+            instance_create "${@:3}"
+            ;;
+        join)
+            instance_join "${@:3}"
+            ;;
+        start)
+            instance_start "${@:3}"
+            ;;
+        restart)
+            instance_restart "${@:3}"
+            ;;
+        stop)
+            instance_stop "${@:3}"
+            ;;
+        remove)
+            instance_remove "${@:3}"
+            ;;
+        version)
+            instance_version "${@:3}"
+            ;;
+        read-log)
+            instance_read_log "${@:3}"
+            ;;
+        delete-log)
+            instance_delete_log "${@:3}"
+            ;;
+        backup)
+            instance_backup "${@:3}"
+            ;;
+        *)
+            echo "Commande non reconnue: $2"
+            print_helpInstance
+            exit 1
+            ;;
+        esac
+        ;;
+    *)
+
+        echo "Commande non reconnue: $1"
+        print_helpMain
+        exit 1
+        ;;
+    esac
+}
+main "$@"
